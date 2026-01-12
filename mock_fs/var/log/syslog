@@ -1,0 +1,9 @@
+2025-01-12 09:00:00 [INFO] System boot completed
+2025-01-12 09:15:00 [WARNING] High CPU usage: 95% on core 0
+2025-01-12 09:30:00 [INFO] Cron job started: backup.sh
+2025-01-12 09:35:00 [INFO] Cron job completed: backup.sh (exit code 0)
+2025-01-12 09:45:00 [ERROR] Disk /dev/sda1: I/O error detected
+2025-01-12 09:50:00 [WARNING] Memory pressure: 90% RAM used
+2025-01-12 09:55:00 [INFO] Network: eth0 link up (1Gbps)
+2025-01-12 09:56:00 [WARNING] Swap usage: 50% used
+2025-01-12 09:57:00 [ERROR] Service nginx failed to start: port 80 in use

@@ -1,0 +1,173 @@
+Wymagania podstawowe:
+
+- działa tryb API i lokalny dla LLM,
+
+- function-calling z walidacją argumentów i listą dozwolonych narzędzi,
+
+- mini-RAG (embeddingi + retriever + kontekst do LLM, wektorowa baza danych),
+
+- guardrails (min. prompt-injection heurystyki, sanitacja ścieżek/wzorca, timeouty).
+
+- ewaluacja (zestaw testów, proste metryki),
+
+- REST API z endpointem /ask, lub inna forma łatwego dostępu do modelu tj. aplikacja, terminal itd.,
+
+- krótka instrukcja uruchomienia.
+
+
+
+Punktacja:
+
+1) Rejestr narzędzi i schematy (allowlist + walidacja) - 15 pkt
+
+(5 pkt) Lista dozwolonych narzędzi + rozdzielenie nazwa -> implementacja (registry/dispatcher).
+
+(6 pkt) Schematy argumentów (JSON Schema / Pydantic): typy, zakresy, enumy, limity długości.
+
+(4 pkt) Obsługa walidacji błędów (czytelne komunikaty, bez stacktrace do klienta).
+
+***
+
+(0 pkt) Jeśli narzędzia są wywoływane bez walidacji (krytyczny błąd).
+
+---
+
+2) Dispatcher + bezpieczeństwo wykonania - 15 pkt
+
+(5 pkt) Timeout na tool (np. wątek/proces z limitem).
+
+(5 pkt) Sanitacja newralgicznych pól (np. pattern bez .., limity wyników/rozmiarów).
+
+(5 pkt) Obsługa wyjątków i kategoryzacja (timeout, validation, tool_error, security_blocked).
+
+---
+
+3) Function-calling (OpenAI/Gemini i lokalny stub) - 15 pkt
+
+(6 pkt) Integracja z OpenAI lub Gemini (prawdziwe function_call) albo równoważny lokalny stub symulujący FC, poprawny `parsing name` + `arguments`.
+
+(5 pkt) Pętla call -> execute -> finalize (po narzędziu finalizacja odpowiedzi).
+
+(4 pkt) Kontrakty I/O narzędzi (spójne formaty wejścia/wyjścia).
+
+---
+
+4) Mini-RAG - 20 pkt
+
+(11 pkt) Embeddingi (lokalnie: sentence-transformers lub API) + indeks (FAISS lub równoważny).
+
+(5 pkt) Retriever (Top-k, mile widziany MMR/reranking).
+
+(4 pkt) Pakowanie kontekstu z meta (źródło, chunk_id) i ograniczeniem długości.
+
+---
+
+5) Guardrails (minimum) - 9 pkt
+
+(3 pkt) Prompt-injection heurystyki (wzorce "ignore previous...", "reveal system prompt...") + scrubbing wejścia.
+
+(3 pkt) Output validation (np. JSON-only przy zadaniach strukturalnych, próba naprawy/odrzucenie).
+
+(3 pkt) Allowlist domen/operacji (np. blokada niedozwolonych hostów - jeżeli potrzebne, wzorców).
+
+***
+
+(-10 pkt) (kara) jeśli daje się uzyskać wyciek system promptu lub path traversal (udokumentowane w red-team).
+
+---
+
+6) Ewaluacja i testy - 8 pkt
+
+(4 pkt) Zestaw testów: min. 6 przypadków (2 format/JSON, 2 red-team injection/path traversal, 2 merytoryczne RAG).
+
+(2 pkt) Metryki: np. recall dla retrievalu, JSON pass-rate, blokady injection, podstawowa latencja, ilość tokenów.
+
+(2 pkt) Raport (CSV/TXT/MD): zwięzłe wnioski (co działa, co zawodzi, plan poprawy).
+
+---
+
+7) REST API (lub inna forma dostępności do usługi) + uruchomienie - 8 pkt
+
+(6 pkt) FastAPI/Flask endpoint `/ask` z parametrami (k, tryb, use_functions), kody 4xx dla blokad.
+
+(2 pkt) Instrukcja lokalna (pip, uvicorn, curl) + plik requirements.txt.
+
+---
+
+8) Observability (logi + metryki) - 5 pkt
+
+(3 pkt) Logi wywołań narzędzi (czas, tool, ok/error).
+
+(2 pkt) Proste metryki (np. sumaryczne w raporcie: success/timeout/error rate).
+
+---
+
+9) Jakość kodu i powtarzalność - 5 pkt
+
+(3 pkt) Struktura repo/projektu, czytelność, typowanie, komentarze tylko tam, gdzie trzeba.
+
+(2 pkt) Powtarzalność: pliki danych/konfiguracji, .env.template, brak sekretów w repo!
+
+
+
+10) Demo/Raport końcowy - 10 pkt
+
+(6 pkt) Krótkie demo (np. gif/screeny) z 2-3 pytaniami (calc, RAG, injection case).
+
+(4 pkt) Opis architektury (1-2 diagramy lub sekcje): przepływ FC, retriever, guardrails.
+
+
+
+*) Dodatkowo
+
+Premie (max +10 pkt, ale łącznie nie więcej niż 100)
+
+(+8 pkt) Reranking (cross-encoder albo sensownie zrobiony fallback + porównanie z baseline).
+
+(+6 pkt) Automatyczny red-team runner + raport (np. JSON -> TXT z agregatami).
+
+
+
+Kary (akumulują się, min. 0 końcowej)
+
+(-10 pkt) Krytyczna podatność: path traversal (np. ../../etc/passwd) przechodzi.
+
+(-10 pkt) Wycieki system/developer promptu na żądanie.
+
+(-5 pkt) Brak timeoutów narzędzi lub brak walidacji argumentów.
+
+(-10 pkt) Twarde sekrety w repo.
+
+
+
+
+
+Co oddać:
+
+Kod + README (setup lokalny, .env.template, API usage).
+
+REST/lub inna forma dostępności do usługi: endpoint `/ask` lub aplikacja, requirements.txt, ewentualnie Dockerfile.
+
+Zestaw testów + raport (CSV/MD/TXT).
+
+Logi/metryki minimalne.
+
+Krótki opis architektury i demo.
+
+
+
+
+
+Progi ocen
+
+5 (bardzo dobry): ≥ 90 pkt i brak krytycznych podatności.
+
+4.5 (dobry+): 85-89 pkt
+
+4 (dobry): 75-84 pkt
+
+3.5 (dostateczny): 65-74 pkt
+
+3 (dostateczny, zaliczony): 55-64 pkt i spełnione (nawet częściowo) "Wymagania podstawowe".
+
+2 (niedostateczny, niezaliczony): < 55 pkt

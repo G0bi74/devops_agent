@@ -1,0 +1,238 @@
+{
+  "cells": [
+    {
+      "cell_type": "code",
+      "id": "initial_id",
+      "metadata": {
+        "collapsed": true
+      },
+      "source": "# Lab 7 - Final mock app",
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "metadata": {
+
+      },
+      "cell_type": "code",
+      "source": "!pip install fastapi",
+      "id": "43991cf30e918213",
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "metadata": {
+
+      },
+      "cell_type": "code",
+      "source": [
+        "import re, json\n",
+        "from fastapi import FastAPI, HTTPException\n",
+        "from pydantic import BaseModel\n",
+        "\n",
+        "FUNCTIONS = [\n",
+        "    {\n",
+        "        \"name\": \"kb_lookup\",\n",
+        "        \"description\": \"Search course KB for short definitions\",\n",
+        "        \"parameters\": {\n",
+        "            \"type\": \"object\",\n",
+        "            \"properties\": {\n",
+        "                \"query\": {\"type\":\"string\",\"description\":\"Query string to search for.\"},\n",
+        "                \"top_k\": {\"type\":\"integer\",\"minimum\":1,\"maximum\":10}\n",
+        "            },\n",
+        "            \"required\":[\"query\"]\n",
+        "        }\n",
+        "    },\n",
+        "    {\n",
+        "        \"name\":\"files_search\",\n",
+        "        \"description\":\"List files matching glob pattern (safe)\",\n",
+        "        \"parameters\": {\n",
+        "            \"type\":\"object\",\n",
+        "            \"properties\": {\n",
+        "                \"pattern\":{\"type\":\"string\",\"description\":\"Glob pattern, max length 64\"}\n",
+        "            },\n",
+        "            \"required\":[\"pattern\"]\n",
+        "        }\n",
+        "    },\n",
+        "    {\n",
+        "        \"name\":\"calculator\",\n",
+        "        \"description\":\"Simple calculator: op and numbers\",\n",
+        "        \"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"add\",\"sub\",\"mul\",\"div\"]},\"a\":{\"type\":\"number\"},\"b\":{\"type\":\"number\"}},\"required\":[\"op\",\"a\",\"b\"]}\n",
+        "    }\n",
+        "]\n",
+        "\n",
+        "# Guardrails\n",
+        "INJECTION_PATTERNS = [r'ignore (all|previous|above) instructions', r'reveal (system|developer) prompt', r'jailbreak', r'override .* rules']\n",
+        "\n",
+        "def scrub_input(text:str):\n",
+        "    t = re.sub(r\"(?i)(ignore (all|previous|above) instructions|reveal (system|developer) prompt|jailbreak)\", '', text)\n",
+        "    return t.strip()\n",
+        "\n",
+        "def detect_injection(text:str):\n",
+        "    return any(re.search(p, text.lower()) for p in INJECTION_PATTERNS)"
+      ],
+      "id": "29d1832b494ff0c6",
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "metadata": {
+
+      },
+      "cell_type": "code",
+      "source": [
+        "# Example pipeline\n",
+        "def retrieve(question:str, k=5):\n",
+        "    # stub: return dummy hits\n",
+        "    return [{'id':f'doc{i}','content':f'Content of document {i} related to {question}.'} for i in range(1,k+1)]\n",
+        "\n",
+        "def pack_context(hits):\n",
+        "    ctx = \"\\n\".join(f\"- {h['content']}\" for h in hits)\n",
+        "    meta = {'retrieved_ids':[h['id'] for h in hits]}\n",
+        "    return ctx, meta\n",
+        "\n",
+        "def model_call_system(prompt:str, functions=None):\n",
+        "    # stub: simple function-calling simulation\n",
+        "    if functions:\n",
+        "        if 'embedding' in prompt.lower():\n",
+        "            return {'function_call': {'name':'kb_lookup', 'arguments': json.dumps({'query':'embedding','top_k':3})}}\n",
+        "        elif 'files' in prompt.lower():\n",
+        "            return {'function_call': {'name':'files_search', 'arguments': json.dumps({'pattern':'*.txt'})}}\n",
+        "        elif 'calculate' in prompt.lower():\n",
+        "            return {'function_call': {'name':'calculator', 'arguments': json.dumps({'a':5,'b':3})}}\n",
+        "    return {'content': f\"Answer to '{prompt[:50]}...' without function call.\"}\n",
+        "\n",
+        "def kb_lookup_impl(query:str, top_k:int=3):\n",
+        "    # stub: return dummy KB hits\n",
+        "    return {'hits': [f'KB item about {query} #{i}' for i in range(1,top_k+1)]}\n",
+        "\n",
+        "def files_search_impl(query:str, top_k:int=3):\n",
+        "    # stub: return dummy file list\n",
+        "    return {'files': [f'file_{i}.txt' for i in range(1,top_k+1)]}\n",
+        "\n",
+        "def calculator_impl(a:float, b:float):\n",
+        "    return {'result': a + b}\n",
+        "\n",
+        "def ask_pipeline(question:str, k=5, use_functions=True):\n",
+        "    # 1) retrieve\n",
+        "    hits = retrieve(question, k=k)\n",
+        "    ctx, meta = pack_context(hits)\n",
+        "    prompt = f\"Question: {question}\\n\\nContext:\\n{ctx}\\n\\nAnswer using context and use functions only if they can provide structured facts.\"\n",
+        "    # 2) call model (possibly function-calling)\n",
+        "    resp = model_call_system(prompt, functions=FUNCTIONS if use_functions else None)\n",
+        "    # 3) if function_call -\u003E execute then re-call model with tool result (simplified)\n",
+        "    if resp.get('function_call'):\n",
+        "        fname = resp['function_call']['name']\n",
+        "        fargs = json.loads(resp['function_call']['arguments'])\n",
+        "        # basic guard: sanitize args lengths, no .. in patterns\n",
+        "        if 'pattern' in fargs and '..' in fargs['pattern']:\n",
+        "            return {'status':'blocked','reason':'unsafe_args'}\n",
+        "        if fname=='kb_lookup':\n",
+        "            out = kb_lookup_impl(**fargs)\n",
+        "        elif fname=='files_search':\n",
+        "            out = files_search_impl(**fargs)\n",
+        "        elif fname=='calculator':\n",
+        "            out = calculator_impl(**fargs)\n",
+        "        else:\n",
+        "            out = {'error':'unknown function'}\n",
+        "        # 4) finalise: send result back to model to format the answer (here stub)\n",
+        "        final = f\"Function {fname} returned: {out}. Use this to answer: {question}\"\n",
+        "        return {'status':'ok','final':final,'tool':fname,'tool_out':out,'meta':meta}\n",
+        "    else:\n",
+        "        return {'status':'ok','final': resp.get('content'), 'meta':meta}"
+      ],
+      "id": "d085efee6bd7dc26",
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "metadata": {
+
+      },
+      "cell_type": "code",
+      "source": [
+        "# Evaluation\n",
+        "GOLD = [\n",
+        "    ('what are embeddings used for?', ['embedding','vector']),\n",
+        "    ('how does RAG work?', ['retrieval','generation']),\n",
+        "]\n",
+        "\n",
+        "def eval_query(q, answer_record):\n",
+        "    # check if any golden keywords appear in final answer or tool output\n",
+        "    keywords = next((g[1] for g in GOLD if g[0]==q), [])\n",
+        "    text = json.dumps(answer_record.get('final','')) + json.dumps(answer_record.get('tool_out',''))\n",
+        "    hits = sum(1 for w in keywords if w in text.lower())\n",
+        "    return {'query': q, 'hits': hits, 'keywords': keywords}\n",
+        "\n",
+        "# quick eval\n",
+        "res = ask_pipeline('what are embeddings used for?', k=4)\n",
+        "print(res)\n",
+        "print('Eval:', eval_query('what are embeddings used for?', res))"
+      ],
+      "id": "b39fc57612093326",
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "metadata": {
+
+      },
+      "cell_type": "code",
+      "source": [
+        "# API\n",
+        "app = FastAPI()\n",
+        "\n",
+        "class AskReq(BaseModel):\n",
+        "    question: str\n",
+        "    k: int = 5\n",
+        "    use_functions: bool = True\n",
+        "    mode: str = 'auto'  # 'api' or 'local' or 'auto'\n",
+        "\n",
+        "@app.post('/ask')\n",
+        "def ask(req: AskReq):\n",
+        "    q = req.question\n",
+        "    if detect_injection(q):\n",
+        "        raise HTTPException(status_code=400, detail='Possible prompt injection detected')\n",
+        "    out = ask_pipeline(q, k=req.k, use_functions=req.use_functions)\n",
+        "    return out\n",
+        "\n",
+        "# To run locally: `uvicorn app:app --reload --port 8000`\n",
+        "print('FastAPI app declared. Run with uvicorn app:app --reload --port 8000')\n"
+      ],
+      "id": "dfe63d1c7181e307",
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "metadata": {
+
+      },
+      "cell_type": "code",
+      "source": "ask_pipeline(\"Czym jest RAG?\", k=3, use_functions=True)",
+      "id": "b722791ec53bf8f6",
+      "outputs": [],
+      "execution_count": null
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "codemirror_mode": {
+        "name": "ipython",
+        "version": 2
+      },
+      "file_extension": ".py",
+      "mimetype": "text/x-python",
+      "name": "python",
+      "nbconvert_exporter": "python",
+      "pygments_lexer": "ipython2",
+      "version": "2.7.6"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}

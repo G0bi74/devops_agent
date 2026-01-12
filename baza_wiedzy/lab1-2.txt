@@ -1,0 +1,401 @@
+---------------------------LAB1----------------------------------------
+import os, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from dotenv import load_dotenv
+
+LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
+
+print(f"Ładowanie modelu: {LOCAL_MODEL_NAME}")
+tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_NAME, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    LOCAL_MODEL_NAME,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto" if torch.cuda.is_available() else None
+)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+print("Urządzenie:", device)
+
+def generate_local(prompt: str, system: str = "You are a helpful assistatnt.", max_new_tokens: int = 128,
+                   temperature: float = 0.0, top_p: float = 0.9):
+    if hasattr(tokenizer, "apply_chat_template"):
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        model_inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True
+        ).to(device)
+    else:
+        text = f"[SYSTEM]\n{system}\n[USER]\n{prompt}\n[ASSISTANT]"
+        model_inputs = tokenizer(
+            text,
+            return_tensors="pt",
+        )
+    with torch.no_grad():
+        output_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0.0),
+            temperature=temperature if temperature > 0.0 else None,
+            top_p=top_p,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id
+
+        )
+    if hasattr(tokenizer, "apply_chat_template"):
+        gen_ids = output_ids[:, model_inputs["input_ids"].shape[-1]:]
+    else:
+        gen_ids = output_ids
+
+    text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+    return text
+
+#try:
+#   out = generate_local("Podaj 3 krotkie pomysły na aktywność fizyczną w domu.")
+#   print(out)
+#except Exception as e:
+#    print("Bład generatora lokalnego:", e)
+
+def count_tokens_local(text: str) -> int:
+    return len(tokenizer.encode(text))
+prompt = "Stwórz 3 punktową listę porad jak uczyć się efektywnie."
+sysmsg = "You are a concise tutor."
+ptoks = count_tokens_local(prompt) + count_tokens_local(sysmsg)
+loc_out = generate_local(
+    prompt=prompt,
+    system=sysmsg,
+    max_new_tokens=120,
+    temperature=0.2,
+    top_p=0.9,
+)
+"""
+ctoks = count_tokens_local(loc_out)
+print("Prompt tokens:", ptoks, "} Completion tokens:", ctoks)
+print("--- Odpowiedź ---\n", loc_out)
+"""
+import numpy as np
+
+def softmax(logits):
+    logits = np.asarray(logits, dtype=float)
+    m = np.max(logits)
+    exps = np.exp(logits - m)
+    probs = exps / np.sum(exps)
+    return probs
+
+def softmax_with_temperature(logits, temperature: float = 1.):
+    logits = np.asarray(logits, dtype=float)
+    T = float(temperature)
+    if T <= 0:
+        raise ValueError("temperature must be > 0")
+    scaled = logits / T
+    m = np.max(scaled)
+    exps = np.exp(scaled - m)
+    probs = exps / np.sum(exps)
+    return probs
+
+def top_k_mask(probs, k: int | None):
+    probs = np.asarray(probs, dtype=float)
+    if k is None or k >= probs.size:
+        return np.ones_like(probs, dtype=bool)
+    idx = np.argsort(-probs)[:k]
+    mask = np.zeros_like(probs, dtype=bool)
+    mask[idx] = True
+    return mask
+
+def top_p_mask(probs, top_p: float = 1.0):
+    probs = np.asarray(probs, dtype=float)
+    p = float(top_p)
+    if p >= 1.0:
+        return np.ones_like(probs, dtype=bool)
+    if p <= 0.0:
+        raise ValueError("top_p must be in (0, 1]")
+    order = np.argsort(-probs)
+    sorted_probs = probs[order]
+    csum = np.cumsum(sorted_probs)
+    cutoff_idx = np.searchsorted(csum, p, side="left")
+    keep = order[: cutoff_idx + 1]
+    mask = np.zeros_like(probs, dtype=bool)
+    mask[keep] = True
+    return mask
+
+def print_array(arr):
+    print(" ".join(f"{v:0.3f}" for v in arr))
+
+def renorm(probs, mask):
+    masked = probs * mask
+    s = masked.sum()
+    if s <= 0:
+        m = np.argmax(probs)
+        out = np.zeros_like(probs)
+        out[m] = 1.0
+        return out
+    return masked / s
+
+
+
+logits = [2.0, 1.0, 0.0, -0.5, -1.0]
+
+print_array(logits)
+probs = softmax(logits)
+print_array(probs)
+probs_tmp = softmax_with_temperature(logits, 0.4)
+print_array(probs_tmp)
+mask_k = top_k_mask(probs_tmp, 3)
+mask_p = top_p_mask(probs_tmp, 0.7)
+print(mask_k)
+print(mask_p)
+renorm_values = renorm(probs, mask_k)
+print_array(renorm_values)
+
+def sample_next_token(
+    logits,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    rng: np.random.Generator | None = None,
+):
+    if rng is None:
+        rng = np.random.default_rng()
+    simple_probs = softmax(logits)
+    probs = softmax_with_temperature(logits, temperature=temperature)
+    mask_k = top_k_mask(probs, top_k)
+    mask_p = top_p_mask(probs, top_p)
+    mask = mask_k & mask_p
+    probs_f = renorm(probs, mask)
+    idx = rng.choice(len(probs_f), p=probs_f)
+    return idx, simple_probs, probs, probs_f, mask
+
+
+logits = [2.0, 1.0, 0.0, -0.5, -1.0]  # przykładowe logity
+idx, simple_probs, raw_probs, filtered_probs, mask = sample_next_token(
+    logits,
+    temperature=0.3,
+    top_p=0.95,   # lub 1.0, jeśli bez nukleusa
+    top_k=None,   # lub np. 40 dla lokalnych LLM
+)
+print("Logits:")
+print_array(logits)
+print("Simple probs (softmax):")
+print_array(simple_probs)
+print("Raw probs (softmax with temperature):")
+print_array(raw_probs)
+print("Filtered probs:")
+print_array(filtered_probs)
+print("Mask:", mask)
+print("Sampled token index:", idx)
+
+
+--------------------------------------------------lab2--------------------------------
+
+import os, time
+from http.client import responses
+
+from openai import OpenAI
+from typing import Dict, Any, Optional, TypedDict
+from google import genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
+
+def chat_once_gemini(
+    prompt: str,
+    system: str = "You are a helpful assistant.",
+    temperature: float = 0.0,
+    top_p: float = 0.95,
+    top_k: int = 40,
+    max_output_tokens: int = 1024,
+) -> Dict[str, Any]:
+    config = genai.types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_output_tokens=max_output_tokens,
+        stop_sequences=["<END>"],
+    )
+
+    t0 = time.time()
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
+    dt = round(time.time() - t0, 3)
+
+    usage = getattr(resp, "usage_metadata", None)
+    usage_dict: Optional[Dict[str, Any]] = None
+    if usage is not None:
+        usage_dict = {
+            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+            "completion_tokens": getattr(usage, "candidates_token_count", None),
+            "total_tokens": getattr(usage, "total_token_count", None),
+            "tool_use_prompt_tokens": getattr(usage, "tool_use_prompt_token_count", None),
+            "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+        }
+
+    return {
+        "text": getattr(resp, "text", str(resp)),
+        "latency_s": dt,
+        "usage": usage_dict
+    }
+
+prompts = [
+    "Summarize this text.",
+    "Summarize this text in one sentence.",
+    "Summarize this text in one sentence using simple ENglish and output as JSON {summary: ...}"
+]
+
+text = """
+    Artificial intelligence (AI) is a field of computer science that builds systems able to perform tasks that typically require human intelligence-such as understanding language, learning from data, reasoning, and perception.
+    What AI can do: perception (vision/speech), reasoning, learning, interaction (natural language), and planning/control.
+    How it works (at a glance):
+    - Symbolic AI: hand-written rules and logic.
+    - Machine learning: models learn patterns from data.
+    - Deep learning: multi-layer neural networks for images, speech, and text.
+"""
+
+"""
+for p in prompts:
+    print("\n---\nPrompt: ", p)
+    responses = chat_once_gemini(f"{p}\n\n{text}")
+    print("---\nAnswer: ", responses["text"])
+    print(f"---\n {responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+"""
+"""
+roles = [
+    "You are a sarcastic assistant.",
+    "you are a formal university lecturer.",
+    "You are a motivational coach."
+]
+
+question = "Explain recursion in one sentence."
+
+for r in roles:
+    print("\n---\nRole: ", r)
+    print("---\nQuestion: ", question)
+    responses = chat_once_gemini(f"{question}", system=r, temperature=0.3)
+    print("---\nAnswer: ", responses["text"])
+    print(f"---\n{responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+"""
+
+question = """
+    Translate English -> Polish:
+    Input: Good morning -> Output: Dzień dobry
+    Input: Thank you -> Output: Dziękuję
+    Input: See you later -> Output:
+"""
+
+
+"""
+print("---\nQuestion: ", question)
+responses = chat_once_gemini(f"{question}", temperature=0.3)
+print("---\nAnswer: ", responses["text"])
+print(f"---\n {responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+"""
+
+"""
+question = "If there are 3 red and 5 blue balls, and you take one randomly, what is the probability it's red?"
+
+print("---\nQuestion: ", question)
+responses = chat_once_gemini(f"{question}", temperature=0.3)
+print("---\nAnswer (without CoT): ", responses["text"])
+print(f"---\n {responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+
+print("---\nQuestion: ", question)
+responses = chat_once_gemini(f"{question}\n Think step by step.", temperature=0.3)
+print("---\nAnswer: ", responses["text"])
+print(f"---\n {responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+"""
+
+import json
+prompt = """
+Classify the sentiment of the text as positive, negative, or neutral. Return JSON {sentiment: ...}
+"""
+text = "I love how easy this app is to use."
+"""
+try:
+    responses = chat_once_gemini(f"{prompt}\n\n{text}", temperature=0.3)
+    print("---\nAnswer: ", responses["text"])
+    data = json.loads(responses["text"])
+    print("Parsowanie JSON OK: ", data)
+    print(f"---\n {responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+except json.JSONDecodeError as e:
+    print("Błąd parsowania JSON.")
+"""
+
+from typing_extensions import TypedDict, Literal
+
+class Sentiment(TypedDict):
+    sentiment: Literal["positive", "negative", "neutral"]
+
+def chat_once_gemini_v2(
+    prompt: str,
+    system: str = "You are a helpful assistant.",
+    temperature: float = 0.0,
+    top_p: float = 0.95,
+    top_k: int = 40,
+    max_output_tokens: int = 1024,
+) -> Dict[str, Any]:
+    config = genai.types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_output_tokens=max_output_tokens,
+        stop_sequences=["<END>"],
+        response_mime_type="application/json",
+        # response_schema=Sentiment
+        response_json_schema={
+            "type": "object",
+            "properties": {
+                "sentiment": {
+                    "type": "string",
+                    "enum": ["positive", "negative", "neutral"]
+                }
+            },
+            "required": ["sentiment"],
+        }
+    )
+
+    t0 = time.time()
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
+    dt = round(time.time() - t0, 3)
+
+    usage = getattr(resp, "usage_metadata", None)
+    usage_dict: Optional[Dict[str, Any]] = None
+    if usage is not None:
+        usage_dict = {
+            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+            "completion_tokens": getattr(usage, "candidates_token_count", None),
+            "total_tokens": getattr(usage, "total_token_count", None),
+            "tool_use_prompt_tokens": getattr(usage, "tool_use_prompt_token_count", None),
+            "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+        }
+
+    return {
+        "text": getattr(resp, "text", str(resp)),
+        "latency_s": dt,
+        "usage": usage_dict
+    }
+
+try:
+    responses = chat_once_gemini_v2(f"{prompt}\n\n{text}", temperature=0.3)
+    print("---\nAnswer: ", responses["text"])
+    data = json.loads(responses["text"])
+    print("Parsowanie JSON OK: ", data)
+    print(f"---\n {responses['latency_s']} s | Tokens: {responses['usage']['total_tokens']}")
+except json.JSONDecodeError as e:
+    print("Błąd parsowania JSON.")

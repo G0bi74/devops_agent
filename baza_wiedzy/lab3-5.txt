@@ -1,0 +1,931 @@
+-------------------------------lab3-----------------------
+ 
+
+import glob, re, time, json, os, torch
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from pydantic import BaseModel, Field
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import List, Any, Dict, Optional, Tuple, Literal
+from dotenv import load_dotenv
+
+
+class CalcArg(BaseModel):
+    a: float
+    b: float
+
+
+class ConvertArgs(BaseModel):
+    value: float
+    from_unit: Literal["km", "mi", "c", "f"]
+    to_unit: Literal["km", "mi", "c", "f"]
+
+
+class SearchArgs(BaseModel):
+    pattern: str = Field(..., max_length=64)
+
+
+class KBArgs(BaseModel):
+    query: str
+    top_k: int = Field(3, ge=1, le=10)
+
+
+class ToolCall(BaseModel):
+    tool: Literal["calculator.add", "calculator.sub", "calculator.mul", "calculator.div",
+    "units.convert", "files.search", "kb.lookup"]
+    args: Dict[str, Any]
+
+
+ALLOWED_TOOLS = {
+    "calculator.add",
+    "calculator.sub",
+    "calculator.mul",
+    "calculator.div",
+    "units.convert",
+    "files.search",
+    "kb.lookup"
+}
+
+
+def _run_tool_sync(tc: ToolCall) -> Dict[str, Any]:
+    if tc.tool not in ALLOWED_TOOLS:
+        raise ValueError("Tool not allowed: " + tc.tool)
+    if tc.tool.startswith("calculator."):
+        args = CalcArg(**tc.args)
+        op = tc.tool.split(".")[1]
+        if op == "add":
+            res = args.a + args.b
+        elif op == "sub":
+            res = args.a - args.b
+        elif op == "mul":
+            res = args.a * args.b
+        elif op == "div":
+            if args.b == 0:
+                raise ValueError("Division by zero")
+            res = args.a / args.b
+        else:
+            raise ValueError("Unknown calculator operation: " + op)
+        return {"result": res}
+    if tc.tool == "units.convert":
+        args = ConvertArgs(**tc.args)
+        if args.from_unit == args.to_unit:
+            return {"result": args.value}
+        if args.from_unit == "km" and args.to_unit == "mi":
+            return {"result": args.value * 0.621371}
+        if args.from_unit == "mi" and args.to_unit == "km":
+            return {"result": args.value / 0.621371}
+        if args.from_unit == "c" and args.to_unit == "f":
+            return {"result": args.value * 9 / 5 + 32}
+        if args.from_unit == "f" and args.to_unit == "c":
+            return {"result": (args.value - 32) * 5 / 9}
+        raise ValueError("Unsupported unit conversion")
+    if tc.tool == "files.search":
+        args = SearchArgs(**tc.args)
+        pattern = args.pattern
+        matched_files = []
+        for filepath in glob.glob("./**/*", recursive=True):
+            if os.path.isfile(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        if re.search(pattern, content):
+                            matched_files.append(filepath)
+                except Exception:
+                    continue
+        return {"files": matched_files[:10]}
+    if tc.tool == "kb.lookup":
+        args = KBArgs(**tc.args)
+        hits = kb_lookup(args.query, top_k=args.top_k)
+        return {"hits": hits}
+    raise ValueError("Unhandled tool")
+
+
+def run_tool(tc: ToolCall, timeout_s: float = 2.0):
+    with ThreadPoolExecutor(max_workr=1) as ex:
+        fut = ex.submit(_run_tool_sync, tc)
+        try:
+            out = fut.result(timeout=timeout_s)
+            return True, out, None
+        except FuturesTimeout:
+            return False, {}, "timeout"
+        except Exception as e:
+            return False, {}, str(e)
+
+
+KB_PATH = './lab03_kb.json'
+print("KB path:", KB_PATH, "exists:", os.path.exists(KB_PATH))
+
+
+def load_kb(path: str = KB_PATH) -> List[dict]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+KB = load_kb() if os.path.exists(KB_PATH) else []
+print("Loaded KB entries:", len(KB))
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+USE_LOCAL = os.getenv("LLM_LOCAL", "0") == "1"
+tokenizer = model = None
+
+load_dotenv()
+
+if USE_LOCAL:
+    LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        LOCAL_MODEL_NAME,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    print(f"Using local model: {LOCAL_MODEL_NAME} on device: {device}")
+else:
+    from google import genai
+
+    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    print(f"Using Gemini model: {GEMINI_MODEL} via Google GenAI")
+
+
+def chat_once_gemini(
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        temperature: float = 0.3,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        max_output_tokens: int = 1024,
+) -> Dict[str, Any]:
+    config = genai.types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_output_tokens=max_output_tokens,
+        stop_sequences=["<END>"],
+    )
+
+    t0 = time.time()
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
+    dt = round(time.time() - t0, 3)
+
+    usage = getattr(resp, "usage_metadata", None)
+    usage_dict: Optional[Dict[str, Any]] = None
+    if usage is not None:
+        usage_dict = {
+            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+            "completion_tokens": getattr(usage, "candidates_token_count", None),
+            "total_tokens": getattr(usage, "total_token_count", None),
+            "tool_use_prompt_tokens": getattr(usage, "tool_use_prompt_token_count", None),
+            "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+        }
+
+    return {
+        "text": getattr(resp, "text", str(resp)),
+        "latency_s": dt,
+        "usage": usage_dict
+    }
+
+
+def count_tokens_local(texts: List[str]) -> List[int]:
+    if tokenizer is None:
+        raise ValueError("Tokenizer is not initialized for local model.")
+    return [len(tokenizer.encode(text)) for text in texts]
+
+
+def generate_local(prompt: str, system: str = "You are a helpful assistant.", max_new_tokens: int = 128,
+                   temperature: float = 0.0, top_p: float = 0.9) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        model_inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True
+        ).to(device)
+    else:
+        text = f"[SYSTEM]\n{system}\n[USER]\n{prompt}\n[ASSISTANT]\n"
+        model_inputs = tokenizer(text, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0.0),
+            top_p=top_p,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        if temperature > 0.0:
+            gen_kwargs["temperature"] = temperature
+
+        output_ids = model.generate(
+            **model_inputs,
+            **gen_kwargs
+        )
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        gen_ids = output_ids[:, model_inputs['input_ids'].shape[-1]:]
+    else:
+        gen_ids = output_ids
+
+    text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+    return text
+
+
+def chat_once_local(
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        temperature: float = 0.3,
+        top_p: float = 0.95,
+        max_output_tokens: int = 1024
+) -> Dict[str, Any]:
+    t0 = time.time()
+    text = generate_local(
+        prompt,
+        system=system,
+        max_new_tokens=max_output_tokens,
+        temperature=temperature,
+        top_p=top_p
+    )
+    dt = round(time.time() - t0, 3)
+    prompt_tokens_count = count_tokens_local([prompt])[0]
+    completion_tokens_count = count_tokens_local([text])[0]
+    return {
+        "text": text,
+        "latency_s": dt,
+        "usage": {
+            "prompt_tokens": prompt_tokens_count,
+            "completion_tokens": completion_tokens_count,
+            "total_tokens": prompt_tokens_count + completion_tokens_count
+        }
+    }
+
+
+def llm_call(
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        temperature: float = 0.3,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        max_output_tokens: int = 1024,
+) -> Dict[str, Any]:
+    if USE_LOCAL:
+        return chat_once_local(
+            prompt,
+            system=system,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens
+        )
+    else:
+        return chat_once_gemini(
+            prompt,
+            system=system,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_output_tokens=max_output_tokens
+        )
+
+
+def normalize(text: str) -> List[str]:
+    text = text.lower()
+    tokens = re.findall(r"[a-ząćęłńóśźż0-9]+", text, flags=re.IGNORECASE)
+    return tokens
+
+
+def score_entry(query_tokens: List[str], entry: Dict[str, Any]) -> float:
+    c_tokens = normalize(entry.get("content", ""))
+    t_tokens = normalize(entry.get("title", ""))
+    tags = [normalize(t) for t in entry.get("tags", [])]
+    tags_flat = [t for sub in tags for t in sub]
+    base = sum(1 for q in query_tokens if q in c_tokens) * 1.0
+    title_bonus = sum(1 for q in query_tokens if q in t_tokens) * 1.5
+    tags_flat = sum(1 for q in query_tokens if q in tags_flat) * 1.2
+    return base + title_bonus + tags_flat
+
+
+def kb_lookup(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    if not KB:
+        return []
+    query_tokens = normalize(query)
+    scored_entries: List[Tuple[float, Dict[str, Any]]] = []
+    for entry in KB:
+        score = score_entry(query_tokens, entry)
+        if score > 0:
+            scored_entries.append((score, entry))
+    scored_entries.sort(key=lambda x: x[0], reverse=True)
+    top_entries = [entry for score, entry in scored_entries[:max(1, top_k)]]
+    return top_entries
+
+
+print(kb_lookup("What is token?", top_k=2))
+
+-----------------------------------lab4----------------------------------
+
+import re, time, json, os, torch, glob
+
+from pydantic import BaseModel, Field, ValidationError
+from typing import List, Any, Dict, Optional, Tuple, Literal
+from dotenv import load_dotenv
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+# ! pip install lm-format-enforcer
+from lmformatenforcer import JsonSchemaParser
+from lmformatenforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
+
+
+class CalcArgs(BaseModel):
+    a: float
+    b: float
+
+
+class ConvertArgs(BaseModel):
+    value: float
+    from_unit: Literal['km', 'mi', 'c', 'f']
+    to_unit: Literal['km', 'mi', 'c', 'f']
+
+
+class SearchArgs(BaseModel):
+    pattern: str = Field(..., max_length=64)
+
+
+class KBArgs(BaseModel):
+    query: str
+    top_k: int = Field(3, ge=1, le=10)
+
+
+class ToolCall(BaseModel):
+    tool: Literal["calculator.add", "calculator.sub", "calculator.mul", "calculator.div",
+    "unit.convert", "files.search", "kb.lookup"]
+    args: Dict[str, Any]
+
+
+ALLOWED_TOOLS = {
+    "calculator.add",
+    "calculator.sub",
+    "calculator.mul",
+    "calculator.div",
+    "unit.convert",
+    "files.search",
+    "kb.lookup"
+}
+
+GUIDED_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["tool", "args"],
+    "properties": {
+        "tool": {
+            "type": "string",
+        },
+        "args": {
+            "type": "object",
+        }
+    }
+}
+
+KB_PATH = './lab03_kb.json'
+print("KB path:", KB_PATH, "exists:", os.path.exists(KB_PATH))
+
+
+def load_kb(path: str = KB_PATH) -> List[dict]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+KB = load_kb() if os.path.exists(KB_PATH) else []
+print("KB size:", len(KB))
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+USE_LOCAL = os.getenv("LLM_LOCAL", "1") == "1"
+tokenizer = model = None
+
+load_dotenv()
+
+if USE_LOCAL:
+    LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        LOCAL_MODEL_NAME,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    print(f"Loaded local model: {LOCAL_MODEL_NAME} on {device}")
+else:
+    from google import genai
+
+    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    print("Using Gemini LLM:", GEMINI_MODEL)
+
+
+def chat_once_gemini(
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        temperature: float = 0.3,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        max_output_tokens: int = 1024,
+) -> Dict[str, Any]:
+    config = genai.types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_output_tokens=max_output_tokens,
+        stop_sequences=["<END>"],
+    )
+
+    t0 = time.time()
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
+    dt = round(time.time() - t0, 3)
+
+    usage = getattr(resp, "usage_metadata", None)
+    usage_dict: Optional[Dict[str, Any]] = None
+    if usage is not None:
+        usage_dict = {
+            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+            "completion_tokens": getattr(usage, "candidates_token_count", None),
+            "total_tokens": getattr(usage, "total_token_count", None),
+            "tool_use_prompt_tokens": getattr(usage, "tool_use_prompt_token_count", None),
+            "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+        }
+
+    return {
+        "text": getattr(resp, "text", str(resp)),
+        "latency_s": dt,
+        "usage": usage_dict
+    }
+
+
+def generate_local(prompt: str, system: str = "You are a helpful assistant.", max_new_tokens: int = 128,
+                   temperature: float = 0.0, top_p: float = 0.9, format_fn=None) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        model_inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True
+        ).to(device)
+    else:
+        text = f"[SYSTEM]\n{system}\n[USER]\n{prompt}\n[ASSISTANT]\n"
+        model_inputs = tokenizer(text, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0.0),
+            top_p=top_p,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        if temperature > 0.0:
+            gen_kwargs["temperature"] = temperature
+        if format_fn is not None:
+            gen_kwargs["prefix_allowed_tokens_fn"] = format_fn
+
+        output_ids = model.generate(
+            **model_inputs,
+            **gen_kwargs
+        )
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        gen_ids = output_ids[:, model_inputs['input_ids'].shape[-1]:]
+    else:
+        gen_ids = output_ids
+
+    text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+    return text
+
+
+def count_tokens_local(text: str) -> int:
+    if tokenizer is None:
+        raise ValueError("Local tokenizer is not initialized.")
+    tokens = tokenizer.tokenize(text)
+    return len(tokens)
+
+
+def chat_once_local(
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        temperature: float = 0.3,
+        top_p: float = 0.95,
+        max_output_tokens: int = 1024,
+        format_fn=None
+) -> Dict[str, Any]:
+    t0 = time.time()
+    text = generate_local(
+        prompt,
+        system=system,
+        max_new_tokens=max_output_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        format_fn=format_fn
+    )
+    dt = round(time.time() - t0, 3)
+    prompt_tokens_count = count_tokens_local(prompt)
+    completion_tokens_count = count_tokens_local(text)
+    return {
+        "text": text,
+        "latency_s": dt,
+        "usage": {
+            "prompt_tokens": prompt_tokens_count,
+            "completion_tokens": completion_tokens_count,
+            "total_tokens": prompt_tokens_count + completion_tokens_count
+        }
+    }
+
+
+def llm_call(
+        prompt: str,
+        system: str = "You are a helpful assistant.",
+        temperature: float = 0.3,
+        top_p: float = 0.95,
+        top_k: int = 40,
+        max_output_tokens: int = 1024,
+        format_fn=None
+) -> Dict[str, Any]:
+    if USE_LOCAL:
+        return chat_once_local(
+            prompt,
+            system=system,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            format_fn=format_fn
+        )
+    else:
+        return chat_once_gemini(
+            prompt,
+            system=system,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_output_tokens=max_output_tokens
+        )
+
+
+def normalize(text: str) -> List[str]:
+    text = text.lower()
+    tokens = re.findall(r"[a-ząćęłńóśźż0-9]+", text, flags=re.IGNORECASE)
+    return tokens
+
+
+def score_entry(query_tokens: List[str], entry: Dict[str, Any]) -> int:
+    c_tokens = normalize(entry.get("content", ""))
+    t_tokens = normalize(entry.get("title", ""))
+    tags = [normalize(t) for t in entry.get("tags", [])]
+    tags_flat = [t for sub in tags for t in sub]
+    base = sum(1 for q in query_tokens if q in c_tokens) * 1.0
+    title_bonus = sum(1 for q in query_tokens if q in t_tokens) * 1.5
+    tags_bonus = sum(1 for q in query_tokens if q in tags_flat) * 1.2
+    return base + title_bonus + tags_bonus
+
+
+def kb_lookup(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    if not KB:
+        return []
+    query_tokens = normalize(query)
+    scored_entries: List[Tuple[float, Dict[str, Any]]] = []
+    for entry in KB:
+        score = score_entry(query_tokens, entry)
+        if score > 0:
+            scored_entries.append((score, entry))
+    scored_entries.sort(key=lambda x: x[0], reverse=True)
+    top_entries = [entry for score, entry in scored_entries[:max(1, top_k)]]
+    return top_entries
+
+
+def _run_tools_sync(tc: ToolCall) -> Dict[str, Any]:
+    if tc.tool not in ALLOWED_TOOLS:
+        raise ValueError(f"Tool {tc.tool} not supported.")
+
+    if tc.tool.startswith("calculator."):
+        args = CalcArgs(**tc.args)
+        op = tc.tool.split(".")[1]
+        if op == "add":
+            res = args.a + args.b
+        elif op == "sub":
+            res = args.a - args.b
+        elif op == "mul":
+            res = args.a * args.b
+        elif op == "div":
+            if args.b == 0:
+                raise ValueError("Division by zero.")
+            res = args.a / args.b
+        else:
+            raise ValueError(f"Unknown calculator operation: {op}")
+        return {"result": res}
+    if tc.tool == "unit.convert":
+        args = ConvertArgs(**tc.args)
+        if args.from_unit == args.to_unit:
+            return {"result": args.value}
+        if args.from_unit == "km" and args.to_unit == "mi":
+            res = args.value * 0.621371
+        elif args.from_unit == "mi" and args.to_unit == "km":
+            res = args.value / 0.621371
+        elif args.from_unit == "c" and args.to_unit == "f":
+            res = args.value * 9 / 5 + 32
+        elif args.from_unit == "f" and args.to_unit == "c":
+            res = (args.value - 32) * 5 / 9
+        else:
+            raise ValueError(f"Unsupported unit conversion: {args.from_unit} to {args.to_unit}")
+        return {"result": res}
+    if tc.tool == "files.search":
+        args = SearchArgs(**tc.args)
+        pattern = args.pattern
+        matched_files = []
+        for filepath in glob.glob("./**/*", recursive=True):
+            if os.path.isfile(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if re.search(pattern, content):
+                            matched_files.append(filepath)
+                except Exception as e:
+                    continue
+        return {"files": matched_files}
+    if tc.tool == "kb.lookup":
+        args = KBArgs(**tc.args)
+        hits = kb_lookup(args.query, top_k=args.top_k)
+        return {"hits": hits}
+    raise ValueError(f"Tool {tc.tool} not implemented.")
+
+
+def run_tool(tc: ToolCall, timeout_s: float = 2.0):
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_run_tools_sync, tc)
+        try:
+            out = fut.result(timeout=timeout_s)
+            return True, out, None
+        except FuturesTimeout:
+            return False, {}, "timeout"
+        except Exception as e:
+            return False, {}, str(e)
+
+
+"""
+tc = ToolCall(
+    tool="kb.lookup",
+    args={
+        "query": "What is token?",
+        "top_k": 2
+    }
+)
+
+success, output, error = run_tool(tc)
+print(success, output, error)
+"""
+
+
+def extract_json_maybe(text: str) -> str:
+    print("Raw LLM output:", text)
+    m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+    if m: return m.group(1)
+    m = re.search(r"(\{[\s\S]*\})", text)
+    return m.group(1) if m else text
+
+
+def ask_for_tool_decision(user_prompt: str, retries: int = 3) -> ToolCall:
+    SYSTEM = """
+        You are a routing controller.
+
+        TASK:
+        Pick EXACTLY ONE tool for the user request.
+        Return ONLY valid minified JSON:
+        {"tool": "<tool name>", "args": { ...required args... }}
+
+        TOOLS AND WHEN TO USE THEM (STRICT):
+
+        1. "kb.lookup"
+           Use this if the user asks for any explanation, definition, concept, meaning, description, summary, background, or "what is ...".
+           Examples: "co to jest embedding", "wyjaśnij...", "czym jest X", "jak działa Y".
+           This is the DEFAULT tool unless another rule clearly matches.
+           Required args:
+           {"query": <the user's question as a short keyword or phrase>, "top_k": 5}
+
+        2. "calculator.add" / "calculator.sub" / "calculator.mul" / "calculator.div"
+           Use ONLY if the user explicitly asks you to compute a numeric result of two numbers.
+           Required args: {"a": float, "b": float}
+
+        3. "units.convert"
+           Use ONLY if the user explicitly asks to convert units between km and mi, or between c and f.
+           Required args:
+           {"value": float, "from_unit": "km|mi|c|f", "to_unit": "km|mi|c|f"}
+
+        4. "files.search"
+           Use ONLY if the user asks to search local documents/files by name/pattern.
+           Required args:
+           {"pattern": string}
+
+        RULES:
+        - If none of the non-default rules match, use "kb.lookup".
+        - Never invent numbers or units if the user didn't ask about numbers or units.
+        - Never leave args incomplete.
+        - No prose, no code fences, ONLY JSON.
+    """
+    INSTRUCTION = "Return ONLY valid JSON matching the schema. No extra text."
+    last_err = None
+
+    if USE_LOCAL:
+        schema_dict = GUIDED_SCHEMA
+        format_fn = build_transformers_prefix_allowed_tokens_fn(
+            tokenizer,
+            JsonSchemaParser(schema_dict)
+        )
+
+    for i in range(retries):
+        raw = llm_call(
+            f"{user_prompt}\n\n{INSTRUCTION}",
+            system=SYSTEM,
+            temperature=0.0,
+            top_p=1.0,
+            max_output_tokens=220,
+            format_fn=format_fn
+        )
+
+        try:
+            js = extract_json_maybe(raw["text"])
+            data = json.loads(js)
+            tc = ToolCall(**data)
+            if tc.tool not in ALLOWED_TOOLS:
+                raise ValidationError(f"Tool {tc.tool} not allowed.")
+            return tc
+        except Exception as e:
+            last_err = str(e)
+            user_prompt = f"{user_prompt}\nIf you fail, return minimal JSON only. Error: {last_err}"
+
+    raise RuntimeError(f"Failed to obtain valid ToolCall JSON after {retries} tries. Last error: {last_err}")
+
+
+def compose_final_with_llm(user_prompt: str, tool_output: Dict[str, Any]) -> Dict[str, Any]:
+    SYSTEM = (
+        "You are a precise assistant.\n"
+        "Answer ONLY using the KB context.\n"
+        "If the KB does not explicitly contain the answer, say exactly: 'Brak danych w KB.'\n"
+        "STRICT RULES:\n"
+        "- Do NOT add any facts, names, places, dates, papers, URLs, or acronyms that are not literally present in KB context.\n"
+        "- Do NOT guess expansions of acronyms.\n"
+        "- Do NOT invent references.\n"
+        "- Output ONE short paragraph in Polish.\n"
+        "- Do NOT output 'References:' section. That will be added later by the system."
+    )
+    PROMPT = (
+        f"User question:\n{user_prompt}\n\n"
+        f"KB context(only permitted knowledge :\n{tool_output}\n\n"
+        f"One paragraph. No references section."
+    )
+
+    resp = llm_call(
+        PROMPT,
+        system=SYSTEM,
+        temperature=0.2,
+        top_p=0.9,
+        max_output_tokens=300,
+    )
+    paragraph = resp["text"].strip()
+
+    refs_list = [f"{h.get('title')} ({h.get('id')})" for h in tool_output.get("hits", [])]
+    refs_text = "References: " + ", ".join(refs_list) if refs_list else "References: None."
+
+    return {"text": paragraph + "\n\n" + refs_text}
+
+
+def call_llm_with_kb_lookup(user_prompt: str, extra_tool_args: Dict[str, Any]) -> str:
+    tc = ask_for_tool_decision(user_prompt)
+    for k, v in extra_tool_args.items():
+        tc.args[k] = v
+    ok, out, err = run_tool(tc)
+    if not ok:
+        return f"Tool call failed: {err}"
+    return compose_final_with_llm(user_prompt, out)["text"]
+
+
+user_prompt = "Wytłumacz krótko co to jest embedding (jeśli możesz, skorzystaj z bazy wiedzy)."
+print(call_llm_with_kb_lookup(user_prompt, {"top_k": 3}))
+
+----------------------------------------lab5-------------------------------------------
+
+import re, random, pandas as pd, time, faiss, numpy as np
+
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+TOPICS = {
+    "ai": [
+        "Large language models predict the next token using transformer architectures.",
+        "Embeddings map text into dense vectors enabling semantic search.",
+        "RAG combines retrieval with generation to ground responses."
+    ],
+    "sport": [
+        "Marathon training plans balance long runs and recovery days.",
+        "Strength training improves running economy and power.",
+        "Interval sessions develop speed and lactate threshold."
+    ],
+    "cooking": [
+        "Sourdough starter needs regular feeding to stay active.",
+        "Sous vide cooking keeps precise temperatures for tenderness.",
+        "Spices bloom in hot oil enhancing aroma and flavor."
+    ],
+    "geo": [
+        "Rivers shape valleys through erosion and sediment transport.",
+        "Plate tectonics explains earthquakes and mountain building.",
+        "Deserts form where evaporation exceeds precipitation."
+    ],
+    "health": [
+        "Sleep supports memory consolidation and hormonal balance.",
+        "Aerobic exercise benefits cardiovascular health and VO2 max.",
+        "Protein intake supports muscle repair and satiety."
+    ]
+}
+
+SEED = 42
+random.seed(SEED)
+
+def synth_docs(n_per_topic=40):
+    docs = []
+    for topic, seed in TOPICS.items():
+        for i in range(n_per_topic):
+            base = random.choice(seed)
+            noise = random.choice(seed)
+            txt = f"{base} {noise} ({topic} #{i})"
+            docs.append({"doc_id": f"{topic}_{i}", "text": txt, "topic": topic})
+    return docs
+
+DOCS = synth_docs(40)
+
+def simple_chunk(text, chunk_chars=280, overlap=40):
+    out = []
+    i = 0
+    while i < len(text):
+        j = min(len(text), i+chunk_chars)
+        out.append((i, j, text[i:j]))
+        if j == len(text): break
+        i = max(0, j-overlap)
+    return out
+
+
+def build_chunks(docs, chunk_chars=280, overlap=40):
+    rows = []
+    for d in docs:
+        for k,(a,b,txt) in enumerate(simple_chunk(d["text"], chunk_chars, overlap)):
+            rows.append({"doc_id": d["doc_id"], "topic": d["topic"], "chunk_id": k, "start": a, "end": b, "chunk": txt})
+    return pd.DataFrame(rows)
+
+CHUNK_SIZE=280; OVERLAP=40
+df = build_chunks(DOCS, CHUNK_SIZE, OVERLAP)
+
+embedder = SentenceTransformer(MODEL_NAME)
+def embed_texts(texts, batch_size=64):
+    return embedder.encode(texts, batch_size=batch_size, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+
+chunks = df["chunk"].tolist()
+t0=time.time()
+embs = embed_texts(chunks, 64)
+build_s = time.time()-t0
+
+index = faiss.IndexFlatIP(embs.shape[1])
+index.add(embs)
+
+def tokenize(text: str):
+    return re.findall(r"[a-z0-9]+", text.lower())
+bm25_corpus = [tokenize(c) for c in chunks]
+bm25 = BM25Okapi(bm25_corpus)
+
+
+def retrieve_dense(query: str, k: int=5):
+    q = embed_texts([query], batch_size=1)
+    scores, idxs = index.search(q, k)
+    return [(float(scores[0][i]), df.iloc[idxs[0][i]].to_dict()) for i in range(k)]
+
+
+def retrieve_bm25(query: str, k: int=5):
+    toks = tokenize(query)
+    scores = bm25.get_scores(toks)
+    idxs = np.argsort(scores)[::-1][:k]
+    return [(float(scores[i]), df.iloc[i].to_dict()) for i in idxs]
+
+
+print(retrieve_dense("What improves running economy?", 3)[0])
+print(retrieve_bm25("What improves running economy?", 3)[0])
