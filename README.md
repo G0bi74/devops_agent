@@ -1,75 +1,75 @@
 # DevOps Runbook Assistant 🔧
 
-AI-powered assistant for diagnosing and resolving server issues using RAG, function-calling, and security guardrails.
+Asystent AI do diagnozowania i rozwiązywania problemów serwerowych z wykorzystaniem RAG, function-calling oraz zabezpieczeń (guardrails).
 
-## 🎯 Features
+## 🎯 Funkcjonalności
 
-- **Log Analysis**: Read and analyze logs from nginx, postgresql, docker, redis
-- **System Monitoring**: Check disk usage, service status
-- **Network Diagnostics**: Ping hosts (with allowlist)
-- **Knowledge Base**: RAG-powered search through DevOps documentation
-- **Security**: Prompt injection detection, path traversal prevention, allowlists
+- **Analiza logów**: Odczyt i analiza logów z nginx, postgresql, docker, redis
+- **Monitoring systemu**: Sprawdzanie miejsca na dysku, statusu usług
+- **Diagnostyka sieci**: Ping hostów (z białą listą)
+- **Baza wiedzy**: Wyszukiwanie RAG w dokumentacji DevOps
+- **Bezpieczeństwo**: Wykrywanie prompt injection, ochrona przed path traversal, białe listy
 
-## 🚀 Quick Start
+## 🚀 Szybki start
 
-### 1. Setup
+### 1. Instalacja
 
 ```bash
-# Clone repository
+# Sklonuj repozytorium
 git clone <repo-url>
 cd devops_agent
 
-# Create virtual environment
+# Utwórz wirtualne środowisko
 python -m venv venv
 venv\Scripts\activate  # Windows
 # source venv/bin/activate  # Linux/Mac
 
-# Install dependencies
+# Zainstaluj zależności
 pip install -r requirements.txt
 ```
 
-### 2. Configuration
+### 2. Konfiguracja
 
 ```bash
-# Copy template and fill in your API keys
+# Skopiuj szablon i uzupełnij klucze API
 copy .env.template .env
 
-# Edit .env with your keys:
+# Edytuj .env z kluczami:
 # - GOOGLE_API_KEY (Gemini)
-# - GROQ_API_KEY (optional, for Groq/Llama)
+# - GROQ_API_KEY (opcjonalnie, dla Groq/Llama)
 ```
 
-### 3. Run
+### 3. Uruchomienie
 
 ```bash
-# Start the API server
+# Uruchom serwer API
 python -m app.main
 
-# Or with uvicorn directly
+# Lub bezpośrednio przez uvicorn
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 4. Test
+### 4. Testowanie
 
 ```bash
-# Open in browser
+# Otwórz w przeglądarce
 http://localhost:8000/docs
 
-# Or use curl
+# Lub użyj curl
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question": "Check nginx logs for errors"}'
+  -d '{"question": "Sprawdź logi nginx pod kątem błędów"}'
 ```
 
-## 📡 API Endpoints
+## 📡 Endpointy API
 
 ### POST /ask
-Main endpoint for asking questions.
+Główny endpoint do zadawania pytań.
 
-**Request:**
+**Żądanie:**
 ```json
 {
-  "question": "Check nginx logs and tell me if there are any errors",
+  "question": "Sprawdź logi nginx i powiedz czy są jakieś błędy",
   "k": 3,
   "use_rag": true,
   "use_tools": true,
@@ -77,11 +77,11 @@ Main endpoint for asking questions.
 }
 ```
 
-**Response:**
+**Odpowiedź:**
 ```json
 {
   "status": "success",
-  "answer": "I found several errors in the nginx logs...",
+  "answer": "Znalazłem kilka błędów w logach nginx...",
   "tool_calls": [
     {
       "tool": "logs.read",
@@ -96,113 +96,113 @@ Main endpoint for asking questions.
 ```
 
 ### GET /health
-Health check endpoint.
+Endpoint sprawdzający stan serwera.
 
 ### GET /tools
-List available tools.
+Lista dostępnych narzędzi.
 
-## 🛠️ Available Tools
+## 🛠️ Dostępne narzędzia
 
-| Tool | Description |
-|------|-------------|
-| `logs.read` | Read service logs (nginx, postgresql, docker, etc.) |
-| `system.disk_usage` | Check disk space |
-| `service.control` | Start/stop/restart/status services |
-| `network.ping` | Ping hosts (allowlist only) |
-| `kb.lookup` | Search knowledge base |
+| Narzędzie | Opis |
+|-----------|------|
+| `logs.read` | Odczyt logów usług (nginx, postgresql, docker, itp.) |
+| `system.disk_usage` | Sprawdzanie miejsca na dysku |
+| `service.control` | Start/stop/restart/status usług |
+| `network.ping` | Ping hostów (tylko z białej listy) |
+| `kb.lookup` | Wyszukiwanie w bazie wiedzy |
 
-## 🔒 Security Features
+## 🔒 Funkcje bezpieczeństwa
 
-### Guardrails
-- **Prompt Injection Detection**: Blocks "ignore instructions", "reveal prompt", jailbreak attempts
-- **Path Traversal Prevention**: Blocks `..`, absolute paths, sensitive files
-- **Allowlists**: Only approved hosts and services can be accessed
-- **Timeouts**: All tool executions have configurable timeouts
-- **No Stacktraces**: Error messages don't leak internal details
+### Guardrails (zabezpieczenia)
+- **Wykrywanie prompt injection**: Blokuje "ignore instructions", "reveal prompt", próby jailbreak
+- **Ochrona przed path traversal**: Blokuje `..`, ścieżki absolutne, wrażliwe pliki
+- **Białe listy**: Dostęp tylko do zatwierdzonych hostów i usług
+- **Timeouty**: Konfigurowalne limity czasowe dla narzędzi
+- **Brak stacktrace'ów**: Komunikaty błędów nie ujawniają wewnętrznych szczegółów
 
-### Testing Security
+### Testowanie bezpieczeństwa
 ```bash
-# Run red-team tests
+# Uruchom testy red-team
 pytest tests/test_redteam.py -v
 ```
 
-## 📊 Running Tests
+## 📊 Uruchamianie testów
 
 ```bash
-# All tests
+# Wszystkie testy
 pytest tests/ -v
 
-# Specific test files
-pytest tests/test_tools.py -v      # Tool validation
-pytest tests/test_redteam.py -v    # Security tests
-pytest tests/test_rag.py -v        # RAG quality
+# Konkretne pliki testowe
+pytest tests/test_tools.py -v      # Walidacja narzędzi
+pytest tests/test_redteam.py -v    # Testy bezpieczeństwa
+pytest tests/test_rag.py -v        # Jakość RAG
 
-# With coverage
+# Z pokryciem kodu
 pytest tests/ --cov=app --cov-report=html
 ```
 
-## 📁 Project Structure
+## 📁 Struktura projektu
 
 ```
 devops_agent/
 ├── app/
-│   ├── main.py              # FastAPI application
+│   ├── main.py              # Aplikacja FastAPI
 │   ├── core/
-│   │   ├── agent.py         # Main agent with FC loop
-│   │   ├── llm_service.py   # LLM providers (Gemini, Groq, local)
+│   │   ├── agent.py         # Główny agent z pętlą FC
+│   │   ├── llm_service.py   # Providery LLM (Gemini, Groq, local)
 │   │   └── security.py      # Guardrails
 │   ├── rag/
-│   │   └── engine.py        # FAISS + embeddings
+│   │   └── engine.py        # FAISS + embeddingi
 │   └── tools/
-│       ├── registry.py      # Pydantic schemas
-│       └── implementations.py # Tool functions
-├── data/runbooks/           # Knowledge base documents
-├── mock_fs/                 # Simulated filesystem for logs
-├── tests/                   # Test suite
-├── .env.template            # Environment template
-└── requirements.txt         # Dependencies
+│       ├── registry.py      # Schematy Pydantic
+│       └── implementations.py # Implementacje narzędzi
+├── data/runbooks/           # Dokumenty bazy wiedzy
+├── mock_fs/                 # Symulowany system plików dla logów
+├── tests/                   # Zestaw testów
+├── .env.template            # Szablon konfiguracji
+└── requirements.txt         # Zależności
 ```
 
-## 🔧 Configuration Options
+## 🔧 Opcje konfiguracji
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LLM_PROVIDER` | `gemini` | Primary LLM (gemini/groq/local) |
-| `GOOGLE_API_KEY` | - | Gemini API key |
-| `GROQ_API_KEY` | - | Groq API key |
-| `TOOL_TIMEOUT_SEC` | `5.0` | Tool execution timeout |
-| `MAX_RAG_RESULTS` | `5` | Max RAG results |
-| `ALLOWED_HOSTS` | localhost,google.com,... | Pingable hosts |
-| `ALLOWED_SERVICES` | nginx,docker,... | Manageable services |
-| `USE_RERANKING` | `1` | Enable cross-encoder reranking |
+| Zmienna | Domyślnie | Opis |
+|---------|-----------|------|
+| `LLM_PROVIDER` | `gemini` | Główny LLM (gemini/groq/local) |
+| `GOOGLE_API_KEY` | - | Klucz API Gemini |
+| `GROQ_API_KEY` | - | Klucz API Groq |
+| `TOOL_TIMEOUT_SEC` | `5.0` | Timeout wykonania narzędzi |
+| `MAX_RAG_RESULTS` | `5` | Maks. wyników RAG |
+| `ALLOWED_HOSTS` | localhost,google.com,... | Hosty dozwolone do pingowania |
+| `ALLOWED_SERVICES` | nginx,docker,... | Usługi do zarządzania |
+| `USE_RERANKING` | `1` | Włącz reranking cross-encoder |
 
-## 📝 Example Queries
+## 📝 Przykładowe zapytania
 
 ```
-"Check nginx logs for errors"
-"Is the database server running?"
-"The API is returning 502 errors, help me diagnose"
-"How much disk space is left?"
-"Ping google.com to check connectivity"
-"Restart the docker service"
+"Sprawdź logi nginx pod kątem błędów"
+"Czy serwer bazy danych działa?"
+"API zwraca błędy 502, pomóż mi zdiagnozować problem"
+"Ile miejsca na dysku zostało?"
+"Pinguj google.com żeby sprawdzić łączność"
+"Zrestartuj usługę docker"
 ```
 
-## 🏆 Scoring Alignment
+## 🏆 Punktacja projektu
 
-| Requirement | Points | Status |
-|------------|--------|--------|
-| Tool registry + schemas | 15 | ✅ |
-| Dispatcher + security | 15 | ✅ |
+| Wymaganie | Punkty | Status |
+|-----------|--------|--------|
+| Rejestr narzędzi + schematy | 15 | ✅ |
+| Dispatcher + bezpieczeństwo | 15 | ✅ |
 | Function-calling | 15 | ✅ |
 | Mini-RAG | 20 | ✅ |
 | Guardrails | 9 | ✅ |
-| Evaluation | 8 | ✅ |
+| Ewaluacja | 8 | ✅ |
 | REST API | 8 | ✅ |
 | Observability | 5 | ✅ |
-| Code quality | 5 | ✅ |
-| Demo/Report | 10 | ✅ |
+| Jakość kodu | 5 | ✅ |
+| Demo/Raport | 10 | ✅ |
 | **Bonus: Reranking** | +8 | ✅ |
 
-## 📜 License
+## 📜 Licencja
 
 MIT
